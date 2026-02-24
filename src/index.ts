@@ -39,14 +39,21 @@ app.get('/', (req: Request, res: Response) => {
   res.send('UD Project API is running');
 });
 
-app.use('/api/auth', authRoutes);
-app.use('/api/upload', uploadRoutes);
-app.use('/api/products', productRoutes);
-app.use('/api/orders', orderRoutes);
-app.use('/api/cart', cartRoutes);
-app.use('/api/categories', categoryRoutes);
-app.use('/api/admin', statsRoutes);
-app.use('/api/contact', contactRoutes);
+const apiRouter = express.Router();
+
+apiRouter.use('/auth', authRoutes);
+apiRouter.use('/upload', uploadRoutes);
+apiRouter.use('/products', productRoutes);
+apiRouter.use('/orders', orderRoutes);
+apiRouter.use('/cart', cartRoutes);
+apiRouter.use('/categories', categoryRoutes);
+apiRouter.use('/admin', statsRoutes);
+apiRouter.use('/contact', contactRoutes);
+
+app.use('/api', apiRouter);
+// Mount at root as a fallback for misconfigured frontend URLs missing /api
+app.use('/', apiRouter);
+
 
 if (process.env.NODE_ENV !== 'production') {
   app.listen(port, () => {
