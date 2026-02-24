@@ -32,7 +32,7 @@ app.use(express.json());
 try {
   const uploadsDir = path.join(process.cwd(), 'uploads');
   app.use('/uploads', express.static(uploadsDir));
-} catch (_) {}
+} catch (_) { }
 
 
 app.get('/', (req: Request, res: Response) => {
@@ -48,6 +48,10 @@ app.use('/api/categories', categoryRoutes);
 app.use('/api/admin', statsRoutes);
 app.use('/api/contact', contactRoutes);
 
-app.listen(port, () => {
-  console.log(`Server is running at http://localhost:${port}`);
-});
+if (process.env.NODE_ENV !== 'production') {
+  app.listen(port, () => {
+    console.log(`Server is running at http://localhost:${port}`);
+  });
+}
+
+export default app;
