@@ -5,10 +5,17 @@ import fs from 'fs';
 import { uploadImage } from '../controllers/uploadController';
 import { protect, admin } from '../middleware/authMiddleware';
 
-const uploadsDir = path.join(process.cwd(), 'uploads');
+const isVercel = process.env.VERCEL === '1' || process.env.VERCEL === 'true' || process.env.NODE_ENV === 'production';
+const uploadsDir = isVercel ? path.join('/tmp', 'uploads') : path.join(process.cwd(), 'uploads');
+
 if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
+  try {
+    fs.mkdirSync(uploadsDir, { recursive: true });
+  } catch (error) {
+    console.warn('Could not create uploads directory (read-only filesystem):', error);
+  }
 }
+
 
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, uploadsDir),

@@ -2,12 +2,18 @@ import { Request, Response } from 'express';
 import path from 'path';
 import fs from 'fs';
 
-const uploadsDir = path.join(process.cwd(), 'uploads');
+const isVercel = process.env.VERCEL === '1' || process.env.VERCEL === 'true' || process.env.NODE_ENV === 'production';
+const uploadsDir = isVercel ? path.join('/tmp', 'uploads') : path.join(process.cwd(), 'uploads');
 
 // Ensure uploads directory exists
 if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
+  try {
+    fs.mkdirSync(uploadsDir, { recursive: true });
+  } catch (error) {
+    console.warn('Could not create uploads directory (read-only filesystem):', error);
+  }
 }
+
 
 // @desc    Upload image
 // @route   POST /api/upload
