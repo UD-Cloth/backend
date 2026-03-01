@@ -12,6 +12,8 @@ export interface IOrder extends Document {
     color?: string;
   }[];
   shippingAddress: {
+    firstName?: string;
+    lastName?: string;
     address: string;
     city: string;
     postalCode: string;
@@ -47,6 +49,8 @@ const OrderSchema: Schema = new Schema({
     }
   ],
   shippingAddress: {
+    firstName: { type: String },
+    lastName: { type: String },
     address: { type: String, required: true },
     city: { type: String, required: true },
     postalCode: { type: String, required: true },

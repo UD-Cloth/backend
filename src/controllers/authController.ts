@@ -85,6 +85,27 @@ export const getUserProfile = async (req: AuthRequest, res: Response) => {
   }
 };
 
+// @desc    Get user dashboard (profile + orders)
+// @route   GET /api/auth/dashboard
+// @access  Private
+export const getUserDashboard = async (req: AuthRequest, res: Response) => {
+  try {
+    const user = req.user;
+    if (user) {
+      const Order = require('../models/Order').default;
+      const orders = await Order.find({ user: user._id }).sort({ createdAt: -1 });
+      res.json({
+        profile: user,
+        orders: orders
+      });
+    } else {
+      res.status(404).json({ message: 'User not found' });
+    }
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
 // @desc    Update user profile
 // @route   PUT /api/auth/profile
 // @access  Private

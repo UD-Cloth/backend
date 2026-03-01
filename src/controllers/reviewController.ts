@@ -45,6 +45,18 @@ export const addReview = async (req: AuthRequest, res: Response) => {
       return;
     }
 
+    // Check if the user has actually purchased this product
+    const Order = require('../models/Order').default; // Using require to avoid top-level cyclic import if any, or just import it at top.
+    const hasPurchased = await Order.findOne({
+      user: userId,
+      'orderItems.product': productId
+    });
+
+    if (!hasPurchased) {
+      res.status(403).json({ message: 'You must purchase this product before reviewing it' });
+      return;
+    }
+
     const existing = await Review.findOne({ user: userId, product: productId });
     if (existing) {
       res.status(400).json({ message: 'You have already reviewed this product' });
