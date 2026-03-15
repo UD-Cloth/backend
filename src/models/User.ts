@@ -13,6 +13,7 @@ export interface IUser extends Document {
   postalCode?: string;
   wishlist: mongoose.Types.ObjectId[];
   isAdmin: boolean;
+  isBlocked: boolean;
   matchPassword(enteredPassword: string): Promise<boolean>;
 }
 
@@ -28,6 +29,7 @@ const UserSchema: Schema = new Schema({
   postalCode: { type: String },
   wishlist: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Product' }],
   isAdmin: { type: Boolean, required: true, default: false },
+  isBlocked: { type: Boolean, required: true, default: false },
 }, {
   timestamps: true,
 });

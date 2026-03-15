@@ -18,13 +18,25 @@ if (!fs.existsSync(uploadsDir)) {
 // @desc    Upload image
 // @route   POST /api/upload
 // @access  Private/Admin
+// Bug #9: Validate file MIME type
+// Bug #156: Return proper production URLs instead of localhost
 export const uploadImage = (req: Request, res: Response) => {
   try {
     if (!req.file || !req.file.filename) {
       res.status(400).json({ message: 'No file uploaded' });
       return;
     }
-    const baseUrl = process.env.BASE_URL || `http://localhost:${process.env.PORT || 5001}`;
+    // MIME type validation is handled by multer fileFilter in routes
+    // Construct the proper base URL from request headers or environment
+    let baseUrl = process.env.BASE_URL;
+
+    // If not set, try to determine from request origin or host
+    if (!baseUrl) {
+      const protocol = process.env.NODE_ENV === 'production' ? 'https' : 'http';
+      const host = req.get('host') || `localhost:${process.env.PORT || 5000}`;
+      baseUrl = `${protocol}://${host}`;
+    }
+
     const url = `${baseUrl}/uploads/${req.file.filename}`;
     res.json({ url });
   } catch (error) {

@@ -22,7 +22,8 @@ export const getStats = async (_req: Request, res: Response) => {
             revenue: { $sum: '$totalPrice' },
           },
         },
-        { $sort: { _id: 1 } },
+        // Bug #80: Sort by most recent first, then reverse for chart display (ascending time order)
+        { $sort: { _id: -1 } },
         { $limit: 30 },
       ]),
     ]);
@@ -34,7 +35,8 @@ export const getStats = async (_req: Request, res: Response) => {
       totalOrders,
       totalProducts,
       totalCustomers,
-      ordersOverTime: ordersByDay.map((d) => ({
+      // Reverse so chart shows oldest→newest (left to right)
+      ordersOverTime: ordersByDay.reverse().map((d) => ({
         date: d._id,
         count: d.count,
         revenue: d.revenue,

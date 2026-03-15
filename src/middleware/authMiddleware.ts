@@ -24,6 +24,11 @@ export const protect = async (req: AuthRequest, res: Response, next: NextFunctio
 
       const user = await User.findById(decoded.id).select('-password');
       if (user) {
+        // Check if user is blocked
+        if (user.isBlocked) {
+          res.status(401).json({ message: 'Your account has been blocked. Please contact support.' });
+          return;
+        }
         req.user = user;
         return next();
       } else {

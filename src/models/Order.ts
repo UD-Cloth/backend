@@ -11,6 +11,9 @@ export interface IOrder extends Document {
     size?: string;
     color?: string;
   }[];
+  // Bug #43: Store customer contact info on order for fulfilment
+  customerEmail?: string;
+  customerPhone?: string;
   shippingAddress: {
     firstName?: string;
     lastName?: string;
@@ -33,6 +36,7 @@ export interface IOrder extends Document {
   paidAt?: Date;
   isDelivered: boolean;
   deliveredAt?: Date;
+  status?: string;
 }
 
 const OrderSchema: Schema = new Schema({
@@ -48,6 +52,9 @@ const OrderSchema: Schema = new Schema({
       color: { type: String }
     }
   ],
+  // Bug #43: Store customer contact info on order
+  customerEmail: { type: String },
+  customerPhone: { type: String },
   shippingAddress: {
     firstName: { type: String },
     lastName: { type: String },
@@ -70,6 +77,7 @@ const OrderSchema: Schema = new Schema({
   paidAt: { type: Date },
   isDelivered: { type: Boolean, required: true, default: false },
   deliveredAt: { type: Date },
+  status: { type: String, default: 'Pending' },
 }, {
   timestamps: true,
 });

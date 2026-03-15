@@ -15,6 +15,13 @@ export interface IProduct extends Document {
   fabric: string;
   isNewItem?: boolean;
   isTrending?: boolean;
+  brand?: string;
+  sku?: string;
+  stock?: number;
+  tags?: string[];
+  status?: string;
+  isFeatured?: boolean;
+  isNewArrival?: boolean;
 }
 
 const ProductSchema: Schema = new Schema({
@@ -34,7 +41,14 @@ const ProductSchema: Schema = new Schema({
   description: { type: String, required: true },
   fabric: { type: String, required: true },
   isNewItem: { type: Boolean, default: false },
-  isTrending: { type: Boolean, default: false }
+  isTrending: { type: Boolean, default: false },
+  brand: { type: String },
+  sku: { type: String },
+  stock: { type: Number, default: 0 },
+  tags: [{ type: String }],
+  status: { type: String, default: 'active', enum: ['active', 'inactive'] },
+  isFeatured: { type: Boolean, default: false },
+  isNewArrival: { type: Boolean, default: false }
 }, {
   timestamps: true,
 });
