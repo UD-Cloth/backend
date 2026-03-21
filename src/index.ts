@@ -30,7 +30,7 @@ const port = process.env.PORT || 5000;
 // Bug #5: Restrict CORS to known origins in production
 const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',')
-  : ['http://localhost:5173', 'http://localhost:3000'];
+  : ['http://localhost:5173', 'http://localhost:3000', 'https://urban-drape.vercel.app', 'https://www.urbandrape.in'];
 
 app.use(cors({
   origin: process.env.NODE_ENV === 'production' ? allowedOrigins : '*',
