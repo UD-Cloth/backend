@@ -9,6 +9,8 @@ import Product from './models/Product';
 import Category from './models/Category';
 import User from './models/User';
 import Review from './models/Review';
+import Order from './models/Order';
+import CMS from './models/CMS';
 import connectDB from './config/db';
 
 /** Category name (or slug) -> used to map products to categories */
@@ -19,6 +21,36 @@ const CATEGORY_IDS: Record<string, string> = {
   jackets: 'Jackets',
   jeans: 'Jeans',
   accessories: 'Accessories',
+};
+
+const cmsData = {
+  storeId: 'main',
+  heroSlides: [
+    {
+      id: 'hero-1',
+      image: 'https://images.unsplash.com/photo-1516257984-b1b4d707412e?w=1600&h=600&fit=crop',
+      title: 'Premium Menswear Collection',
+      subtitle: 'Upgrade your wardrobe with our latest arrivals.',
+      cta: 'Shop Collection',
+      link: '/shop'
+    }
+  ],
+  promoBanner: {
+    isActive: true,
+    text: 'Free Shipping on your first order! Use code WELCOME',
+    link: '/shop',
+    bgColor: '#1e3a5f',
+    textColor: '#FFFFFF'
+  },
+  testimonials: [
+    {
+      id: 'test-1',
+      name: 'Michael T.',
+      role: 'Verified Buyer',
+      content: 'The quality of the Oxford shirts is unmatched. Urban Drape is my go-to for office wear.',
+      rating: 5
+    }
+  ]
 };
 
 const categoriesData = [
@@ -207,6 +239,8 @@ const importData = async () => {
   try {
     await connectDB();
 
+    await CMS.deleteMany();
+    await Order.deleteMany();
     await Review.deleteMany();
     await Product.deleteMany();
     await Category.deleteMany();
@@ -214,13 +248,20 @@ const importData = async () => {
     const createdCategories = await Category.insertMany(categoriesData);
     const nameToId = new Map(createdCategories.map((c) => [c.name.toLowerCase(), c._id]));
 
-    const productsMap = productsData.map((product) => {
+    const productsMap = productsData.map((product, index) => {
       const categoryName = CATEGORY_IDS[product.categoryId] || product.categoryId;
       const categoryId = nameToId.get(categoryName.toLowerCase()) ?? createdCategories[0]._id;
-      const { categoryId: _catId, ...productInfo } = product;
+      const { categoryId: _catId, isNewItem, ...productInfo } = product as any;
       return {
         ...productInfo,
         category: categoryId,
+        stock: 100,
+        brand: "Urban Drape",
+        sku: `UD-100${index}`,
+        tags: ["menswear", "premium"],
+        isFeatured: index < 4,
+        isNewItem: isNewItem || false,
+        isNewArrival: isNewItem || false,
       };
     });
 
@@ -243,6 +284,65 @@ const importData = async () => {
       console.log(`Admin user already exists: ${adminEmail}`);
     }
 
+    // Demo standard user (create if not exists)
+    const userEmail = 'user@example.com';
+    const userPassword = 'user123';
+    const existingUser = await User.findOne({ email: userEmail });
+    if (!existingUser) {
+      await User.create({
+        firstName: 'Standard',
+        lastName: 'User',
+        email: userEmail,
+        password: userPassword,
+        isAdmin: false,
+      });
+      console.log(`Demo standard user created: ${userEmail} / ${userPassword}`);
+    } else {
+      console.log(`Standard user already exists: ${userEmail}`);
+    }
+
+    const standardUser = await User.findOne({ email: userEmail });
+
+    // Seed CMS
+    await CMS.create(cmsData);
+    console.log('CMS data seeded.');
+
+    // Seed Orders
+    const sampleProducts = await Product.find({}).limit(2);
+    if (sampleProducts.length > 0 && standardUser) {
+      await Order.create({
+        user: standardUser._id,
+        orderItems: [
+          {
+            name: sampleProducts[0].name,
+            qty: 1,
+            image: sampleProducts[0].image,
+            price: sampleProducts[0].price,
+            product: sampleProducts[0]._id,
+            size: "M",
+            color: "White"
+          }
+        ],
+        shippingAddress: {
+          address: "123 Main St",
+          city: "Mumbai",
+          postalCode: "400001",
+          state: "Maharashtra"
+        },
+        paymentMethod: "Credit Card",
+        taxPrice: 100,
+        shippingPrice: 50,
+        totalPrice: sampleProducts[0].price + 150,
+        isPaid: true,
+        paidAt: new Date(),
+        isDelivered: false,
+        status: "Processing",
+        customerEmail: standardUser.email,
+        customerPhone: "9876543210"
+      });
+      console.log('Mock orders seeded.');
+    }
+
     console.log('Data imported successfully.');
     process.exit(0);
   } catch (error) {
@@ -255,11 +355,13 @@ const destroyData = async () => {
   try {
     await connectDB();
 
+    await CMS.deleteMany();
+    await Order.deleteMany();
     await Review.deleteMany();
     await Product.deleteMany();
     await Category.deleteMany();
 
-    console.log('Categories, products, and reviews destroyed.');
+    console.log('Categories, products, reviews, CMS, and orders destroyed.');
     process.exit(0);
   } catch (error) {
     console.error('Destroy error:', error);
