@@ -268,8 +268,8 @@ const importData = async () => {
     await Product.insertMany(productsMap);
 
     // Demo admin user (create if not exists)
-    const adminEmail = process.env.SEED_ADMIN_EMAIL || 'admin@example.com';
-    const adminPassword = process.env.SEED_ADMIN_PASSWORD || 'admin123';
+    const adminEmail = process.env.SEED_ADMIN_EMAIL || 'admin@example.com'
+    const adminPassword = process.env.SEED_ADMIN_PASSWORD || 'Admin@123';
     const existingAdmin = await User.findOne({ email: adminEmail });
     if (!existingAdmin) {
       await User.create({
@@ -286,7 +286,7 @@ const importData = async () => {
 
     // Demo standard user (create if not exists)
     const userEmail = 'user@example.com';
-    const userPassword = 'user123';
+    const userPassword = 'User@1234';
     const existingUser = await User.findOne({ email: userEmail });
     if (!existingUser) {
       await User.create({
