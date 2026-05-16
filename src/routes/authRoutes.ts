@@ -1,5 +1,5 @@
 import express from 'express';
-import { authUser, registerUser, getUserProfile, getUserDashboard, updateUserProfile, getWishlist, toggleWishlist } from '../controllers/authController';
+import { authUser, registerUser, getUserProfile, getUserDashboard, updateUserProfile, getWishlist, toggleWishlist, resendVerification, verifyEmail, forgotPassword, resetPassword } from '../controllers/authController';
 import { protect, AuthRequest } from '../middleware/authMiddleware';
 import rateLimit from 'express-rate-limit';
 
@@ -22,6 +22,16 @@ const registerLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+// Sprint 2: rate-limit token-issuing & token-consuming endpoints to prevent
+// account-enumeration timing attacks and brute force on reset/verify tokens.
+const tokenLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 5,
+  message: { message: 'Too many requests, please try again later' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 router.post('/register', registerLimiter, registerUser);
 router.post('/login', loginLimiter, authUser);
 router.get('/profile', protect, (req, res) => getUserProfile(req as AuthRequest, res));
@@ -29,5 +39,9 @@ router.get('/dashboard', protect, (req, res) => getUserDashboard(req as AuthRequ
 router.put('/profile', protect, (req, res) => updateUserProfile(req as AuthRequest, res));
 router.get('/wishlist', protect, (req, res) => getWishlist(req as AuthRequest, res));
 router.post('/wishlist', protect, (req, res) => toggleWishlist(req as AuthRequest, res));
+router.post('/resend-verification', tokenLimiter, resendVerification);
+router.post('/verify-email', tokenLimiter, verifyEmail);
+router.post('/forgot-password', tokenLimiter, forgotPassword);
+router.post('/reset-password', tokenLimiter, resetPassword);
 
 export default router;

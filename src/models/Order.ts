@@ -1,4 +1,5 @@
 import mongoose, { Document, Schema } from 'mongoose';
+import { ORDER_STATUSES, OrderStatus } from '../constants/orderStatus';
 
 export interface IOrder extends Document {
   user: mongoose.Types.ObjectId;
@@ -29,8 +30,13 @@ export interface IOrder extends Document {
     update_time: string;
     email_address: string;
   };
+  // Sprint 4 / BUG-B-001: items subtotal (price × qty across orderItems).
+  // Without this, totals can't be reconciled (items + tax + shipping − discount).
+  itemsPrice: number;
   taxPrice: number;
   shippingPrice: number;
+  couponCode?: string;
+  discountAmount?: number;
   totalPrice: number;
   isPaid: boolean;
   paidAt?: Date;
@@ -70,16 +76,34 @@ const OrderSchema: Schema = new Schema({
     update_time: { type: String },
     email_address: { type: String },
   },
+  itemsPrice: { type: Number, required: true, default: 0.0 },
   taxPrice: { type: Number, required: true, default: 0.0 },
   shippingPrice: { type: Number, required: true, default: 0.0 },
+  couponCode: { type: String },
+  discountAmount: { type: Number, default: 0 },
   totalPrice: { type: Number, required: true, default: 0.0 },
   isPaid: { type: Boolean, required: true, default: false },
   paidAt: { type: Date },
   isDelivered: { type: Boolean, required: true, default: false },
   deliveredAt: { type: Date },
-  status: { type: String, default: 'Pending' },
+  // Bug #132/#168: Constrain status to a known enum sourced from shared
+  // constants so model + controllers stay in sync.
+  status: {
+    type: String,
+    default: 'Pending' as OrderStatus,
+    enum: ORDER_STATUSES,
+  },
 }, {
   timestamps: true,
 });
+
+// Sprint 3: indexes for the order queries the API actually runs.
+// - { user, createdAt }: getMyOrders sorts by createdAt for the logged-in user.
+// - status: admin filter.
+// - createdAt: admin "all orders" sort.
+OrderSchema.index({ user: 1, createdAt: -1 });
+OrderSchema.index({ status: 1 });
+OrderSchema.index({ createdAt: -1 });
+OrderSchema.index({ couponCode: 1 }, { sparse: true });
 
 export default mongoose.model<IOrder>('Order', OrderSchema);

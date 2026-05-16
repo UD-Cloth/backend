@@ -1,5 +1,8 @@
 import { Request, Response } from 'express';
 import Category from '../models/Category';
+import Product from '../models/Product';
+
+const UNCATEGORIZED = 'Uncategorized';
 
 // @desc    Get all categories
 // @route   GET /api/categories
@@ -19,10 +22,24 @@ export const getCategories = async (_req: Request, res: Response) => {
 export const createCategory = async (req: Request, res: Response) => {
   try {
     const { name, image } = req.body;
-    const category = new Category({ name, image });
+    // Bug #126: Reject empty / whitespace-only category names.
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      res.status(400).json({ message: 'Category name is required' });
+      return;
+    }
+    const category = new Category({ name: name.trim(), image });
     const createdCategory = await category.save();
+    // Bug #133: 201 already returned on create.
     res.status(201).json(createdCategory);
-  } catch (error) {
+  } catch (error: any) {
+    if (error?.code === 11000) {
+      res.status(409).json({ message: 'A category with this name already exists' });
+      return;
+    }
+    if (error?.name === 'ValidationError') {
+      res.status(400).json({ message: error.message });
+      return;
+    }
     res.status(500).json({ message: 'Server Error' });
   }
 };
@@ -56,13 +73,29 @@ export const deleteCategory = async (req: Request, res: Response) => {
   try {
     const category = await Category.findById(req.params.id);
 
-    if (category) {
-      await Category.deleteOne({ _id: category._id });
-      res.json({ message: 'Category removed' });
-    } else {
+    if (!category) {
       res.status(404).json({ message: 'Category not found' });
+      return;
     }
-  } catch (error) {
+
+    // Bug #197: Before deleting, reassign any products that referenced this
+    // category to "Uncategorized" so they remain visible/searchable instead
+    // of rendering as `Category: undefined` on the storefront.
+    const reassigned = await Product.updateMany(
+      { category: category.name },
+      { $set: { category: UNCATEGORIZED } }
+    );
+
+    await Category.deleteOne({ _id: category._id });
+    res.json({
+      message: 'Category removed',
+      productsReassigned: reassigned.modifiedCount ?? 0,
+    });
+  } catch (error: any) {
+    if (error?.name === 'CastError') {
+      res.status(400).json({ message: 'Invalid ID format' });
+      return;
+    }
     res.status(500).json({ message: 'Server Error' });
   }
 };

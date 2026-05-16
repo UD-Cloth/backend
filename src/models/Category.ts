@@ -6,7 +6,8 @@ export interface ICategory extends Document {
 }
 
 const CategorySchema: Schema = new Schema({
-  name: { type: String, required: true },
+  // Sprint 3: enforce unique category names; trim whitespace.
+  name: { type: String, required: true, unique: true, trim: true },
   image: { type: String, required: true }
 }, {
   timestamps: true

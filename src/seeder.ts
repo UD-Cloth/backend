@@ -11,6 +11,9 @@ import User from './models/User';
 import Review from './models/Review';
 import Order from './models/Order';
 import CMS from './models/CMS';
+import Cart from './models/Cart';
+import AbandonedCart from './models/AbandonedCart';
+import Settings from './models/Settings';
 import connectDB from './config/db';
 
 /** Category name (or slug) -> used to map products to categories */
@@ -242,6 +245,8 @@ const importData = async () => {
     await CMS.deleteMany();
     await Order.deleteMany();
     await Review.deleteMany();
+    await Cart.deleteMany();
+    await AbandonedCart.deleteMany();
     await Product.deleteMany();
     await Category.deleteMany();
 
@@ -307,15 +312,26 @@ const importData = async () => {
     await CMS.create(cmsData);
     console.log('CMS data seeded.');
 
-    // Seed Orders
+    // Sprint 5/6: Settings is a singleton driving tax/shipping/store info.
+    // Reset to defaults on each seed so the dev environment is reproducible.
+    await Settings.deleteMany();
+    await Settings.create({});
+    console.log('Settings singleton seeded with defaults.');
+
+    // Seed Orders — Sprint 4 / BUG-B-001 requires itemsPrice on the order
+    // document. Reconcile totalPrice = itemsPrice + tax + shipping.
     const sampleProducts = await Product.find({}).limit(2);
     if (sampleProducts.length > 0 && standardUser) {
+      const itemQty = 1;
+      const itemsPrice = sampleProducts[0].price * itemQty;
+      const taxPrice = 100;
+      const shippingPrice = 50;
       await Order.create({
         user: standardUser._id,
         orderItems: [
           {
             name: sampleProducts[0].name,
-            qty: 1,
+            qty: itemQty,
             image: sampleProducts[0].image,
             price: sampleProducts[0].price,
             product: sampleProducts[0]._id,
@@ -330,9 +346,10 @@ const importData = async () => {
           state: "Maharashtra"
         },
         paymentMethod: "Credit Card",
-        taxPrice: 100,
-        shippingPrice: 50,
-        totalPrice: sampleProducts[0].price + 150,
+        itemsPrice,
+        taxPrice,
+        shippingPrice,
+        totalPrice: itemsPrice + taxPrice + shippingPrice,
         isPaid: true,
         paidAt: new Date(),
         isDelivered: false,
@@ -358,10 +375,12 @@ const destroyData = async () => {
     await CMS.deleteMany();
     await Order.deleteMany();
     await Review.deleteMany();
+    await Cart.deleteMany();
+    await AbandonedCart.deleteMany();
     await Product.deleteMany();
     await Category.deleteMany();
 
-    console.log('Categories, products, reviews, CMS, and orders destroyed.');
+    console.log('Categories, products, reviews, carts, CMS, and orders destroyed.');
     process.exit(0);
   } catch (error) {
     console.error('Destroy error:', error);

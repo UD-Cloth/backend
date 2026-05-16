@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import mongoose from 'mongoose';
 import Product from '../models/Product';
 import Category from '../models/Category';
 
@@ -39,6 +40,7 @@ export const getProducts = async (req: Request, res: Response) => {
         { name: searchRegex },
         { description: searchRegex },
         { brand: searchRegex },
+        { sku: searchRegex },
         { tags: searchRegex },
         ...(categoryIds.length > 0 ? [{ category: { $in: categoryIds } }] : []),
       ];
@@ -49,11 +51,13 @@ export const getProducts = async (req: Request, res: Response) => {
     const limitNum = Math.min(100, Math.max(1, parseInt(limit as string) || 20));
     const skip = (pageNum - 1) * limitNum;
 
+    // Bug #142: .lean() — read-only listing skips Mongoose hydration, ~3-5x faster.
     const products = await Product.find(queryArgs)
       .populate('category', 'name')
       .skip(skip)
       .limit(limitNum)
-      .sort({ createdAt: -1 });
+      .sort({ createdAt: -1 })
+      .lean();
 
     const total = await Product.countDocuments(queryArgs);
 
@@ -84,12 +88,18 @@ export const getProductById = async (req: Request, res: Response) => {
     const product = await Product.findById(req.params.id).populate('category', 'name');
     if (product) {
       const Review = require('../models/Review').default;
+      // Bug #121: Limit embedded reviews to ~20 most recent. Clients that need
+      // more should use the paginated /api/reviews endpoint with `?productId=`.
+      const reviewsLimit = Math.min(50, Math.max(1, parseInt(String(req.query.reviewsLimit ?? '20'), 10) || 20));
       const reviews = await Review.find({ product: product._id })
         .populate('user', 'firstName lastName')
-        .sort({ createdAt: -1 });
+        .sort({ createdAt: -1 })
+        .limit(reviewsLimit);
+      const reviewsTotal = await Review.countDocuments({ product: product._id });
 
       const productObj = product.toObject() as any;
       productObj.reviews = reviews;
+      productObj.reviewsTotal = reviewsTotal;
       res.json(productObj);
     } else {
       res.status(404).json({ message: 'Product not found' });
@@ -114,25 +124,47 @@ export const searchProducts = async (req: Request, res: Response) => {
       res.json([]);
       return;
     }
-    const searchRegex = new RegExp(q.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    const trimmed = q.trim();
+    if (!trimmed) {
+      res.json([]);
+      return;
+    }
+    const cap = Math.min(50, Math.max(1, Number(limit) || 5));
 
-    // Bug #16: Only return active products
-    // Bug #97/#98: Also search brand, tags, and category names
-    const matchingCats = await Category.find({ name: searchRegex }).select('_id');
-    const matchCatIds = matchingCats.map((c) => c._id);
-    const products = await Product.find({
-      status: 'active',
-      $or: [
-        { name: searchRegex },
-        { description: searchRegex },
-        { brand: searchRegex },
-        { tags: searchRegex },
-        ...(matchCatIds.length > 0 ? [{ category: { $in: matchCatIds } }] : []),
-      ]
-    })
-      .select('name price image category')
-      .populate('category', 'name')
-      .limit(Number(limit) || 5);
+    // Sprint 7 / BUG-B-038: use the `text` index added in Sprint 3 (covers
+    // name, description, tags). Falls back to a regex pass when `$text` returns
+    // nothing — single-character queries don't match the text index, and we
+    // still want to find SKUs/brand prefixes the index doesn't cover.
+    let products: any[] = [];
+    if (trimmed.length >= 2) {
+      products = await Product.find(
+        { status: 'active', $text: { $search: trimmed } },
+        { score: { $meta: 'textScore' } }
+      )
+        .select('name price image category brand sku')
+        .populate('category', 'name')
+        .sort({ score: { $meta: 'textScore' } })
+        .limit(cap);
+    }
+
+    if (products.length === 0) {
+      const safeRegex = new RegExp(trimmed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      const matchingCats = await Category.find({ name: safeRegex }).select('_id');
+      const matchCatIds = matchingCats.map((c) => c._id);
+      products = await Product.find({
+        status: 'active',
+        $or: [
+          { name: safeRegex },
+          { brand: safeRegex },
+          { sku: safeRegex },
+          { tags: safeRegex },
+          ...(matchCatIds.length > 0 ? [{ category: { $in: matchCatIds } }] : []),
+        ],
+      })
+        .select('name price image category brand sku')
+        .populate('category', 'name')
+        .limit(cap);
+    }
 
     res.json(products);
   } catch (error: any) {
@@ -162,9 +194,33 @@ export const createProduct = async (req: Request, res: Response) => {
       return;
     }
 
+    // Sprint 5 / BUG-B-049: validate category is a real ObjectId pointing to an
+    // existing Category, and that price/originalPrice make sense.
+    if (!category || !mongoose.Types.ObjectId.isValid(category)) {
+      res.status(400).json({ message: 'A valid category is required' });
+      return;
+    }
+    const categoryExists = await Category.exists({ _id: category });
+    if (!categoryExists) {
+      res.status(400).json({ message: 'Category not found' });
+      return;
+    }
+    const numPrice = Number(price);
+    if (!Number.isFinite(numPrice) || numPrice < 0) {
+      res.status(400).json({ message: 'Price must be a non-negative number' });
+      return;
+    }
+    if (originalPrice !== undefined) {
+      const numOrig = Number(originalPrice);
+      if (!Number.isFinite(numOrig) || numOrig < numPrice) {
+        res.status(400).json({ message: 'originalPrice must be ≥ price' });
+        return;
+      }
+    }
+
     const product = new Product({
       name: sanitizeHTML(name.trim()),
-      price: price ?? 0,
+      price: numPrice,
       originalPrice: originalPrice,
       description: sanitizeHTML(description.trim()),
       image: image || '/images/sample.jpg',
@@ -184,12 +240,24 @@ export const createProduct = async (req: Request, res: Response) => {
       isNewArrival: isNewArrival ?? false
     });
 
-    const createdProduct = await product.save();
-    res.status(201).json(createdProduct);
+    try {
+      const createdProduct = await product.save();
+      res.status(201).json(createdProduct);
+    } catch (err: any) {
+      // Sprint 5 / BUG-B-050: surface duplicate SKU as a clean 409.
+      if (err?.code === 11000) {
+        res.status(409).json({ message: 'A product with this SKU already exists', keyValue: err.keyValue });
+        return;
+      }
+      throw err;
+    }
   } catch (error: any) {
-    // Bug #138/#139: Return 400 for invalid IDs, 500 for real server errors
     if (error.kind === 'ObjectId' || error.name === 'CastError') {
       res.status(400).json({ message: 'Invalid ID format' });
+      return;
+    }
+    if (error.name === 'ValidationError') {
+      res.status(400).json({ message: error.message });
       return;
     }
     res.status(500).json({ message: error.message || 'Server Error' });
@@ -206,9 +274,47 @@ export const updateProduct = async (req: Request, res: Response) => {
     const product = await Product.findById(req.params.id);
 
     if (product) {
+      // Bug #188: Optimistic concurrency — if the client sends `expectedVersion`
+      // (the `__v` from the doc they loaded), reject with 409 when another
+      // admin has saved in between. Clients that don't send it keep working
+      // with last-write-wins, so this is opt-in and back-compatible.
+      const expectedVersion = req.body.expectedVersion;
+      if (
+        expectedVersion !== undefined &&
+        Number.isFinite(Number(expectedVersion)) &&
+        Number(expectedVersion) !== (product as any).__v
+      ) {
+        res.status(409).json({
+          message: 'This product was modified by someone else. Reload and try again.',
+          currentVersion: (product as any).__v,
+        });
+        return;
+      }
+
+      // Sprint 7 / BUG-B-052: validate status enum at the controller layer so
+      // bad input returns 400 with a clear message instead of bubbling to a
+      // generic 500.
+      if (status !== undefined && status !== 'active' && status !== 'inactive') {
+        res.status(400).json({ message: "Status must be 'active' or 'inactive'" });
+        return;
+      }
+      if (price !== undefined) {
+        const numPrice = Number(price);
+        if (!Number.isFinite(numPrice) || numPrice < 0) {
+          res.status(400).json({ message: 'Price must be a non-negative number' });
+          return;
+        }
+        product.price = numPrice;
+      }
+      if (originalPrice !== undefined) {
+        const numOrig = Number(originalPrice);
+        if (!Number.isFinite(numOrig) || numOrig < (price ?? product.price)) {
+          res.status(400).json({ message: 'originalPrice must be ≥ price' });
+          return;
+        }
+        product.originalPrice = numOrig;
+      }
       if (name !== undefined) product.name = sanitizeHTML(name);
-      if (price !== undefined) product.price = price;
-      if (originalPrice !== undefined) product.originalPrice = originalPrice;
       if (description !== undefined) product.description = sanitizeHTML(description);
       if (image !== undefined) product.image = image;
       if (images) product.images = images;

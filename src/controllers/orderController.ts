@@ -1,12 +1,28 @@
 import { Request, Response } from 'express';
+import mongoose from 'mongoose';
 import Order from '../models/Order';
 import Product from '../models/Product';
+import Promotion from '../models/Promotion';
+import Settings from '../models/Settings';
 import { AuthRequest } from '../middleware/authMiddleware';
+import { decrementUsage } from './promotionController';
+// Bug #168: shared status enum (single source of truth)
+import { ORDER_STATUSES } from '../constants/orderStatus';
 
 // @desc    Create new order
 // @route   POST /api/orders
 // @access  Private
 export const addOrderItems = async (req: AuthRequest, res: Response) => {
+  // Sprint 1 / BUG-B-012: orderRoutes now uses `protect`, not `optionalAuth`,
+  // so req.user is guaranteed. Belt-and-braces check here too.
+  if (!req.user?._id) {
+    res.status(401).json({ message: 'Authentication required to place an order' });
+    return;
+  }
+
+  // Track which products we successfully decremented so we can refund on failure.
+  const decremented: { product: string; qty: number }[] = [];
+
   try {
     const { orderItems, shippingAddress, paymentMethod } = req.body;
 
@@ -15,41 +31,139 @@ export const addOrderItems = async (req: AuthRequest, res: Response) => {
       return;
     }
 
-    // Bug #13: Validate stock and Bug #17: Recalculate prices server-side
+    // Sprint 1 / BUG-B-014: Decrement stock atomically with a guard so two
+    // concurrent orders cannot both pass the stock check and oversell.
     let calculatedItemsPrice = 0;
+    const productLookup = new Map<string, any>();
+
     for (const item of orderItems) {
-      const product = await Product.findById(item.product);
-      if (!product) {
-        res.status(404).json({ message: `Product not found: ${item.product}` });
+      if (!mongoose.Types.ObjectId.isValid(item.product)) {
+        res.status(400).json({ message: `Invalid product ID: ${item.product}` });
         return;
       }
-      // Bug #16: Block inactive products from being ordered
-      if (product.status === 'inactive') {
-        res.status(400).json({ message: `Product "${product.name}" is no longer available` });
+      const qty = Math.max(1, Math.floor(Number(item.qty) || 0));
+      if (qty < 1) {
+        res.status(400).json({ message: 'Order item quantity must be ≥ 1' });
         return;
       }
-      // Bug #13: Check stock
-      if (product.stock !== undefined && product.stock < item.qty) {
-        res.status(400).json({ message: `Insufficient stock for "${product.name}". Available: ${product.stock}` });
+
+      // Atomic compare-and-decrement: only succeeds if active AND stock ≥ qty.
+      const updated = await Product.findOneAndUpdate(
+        {
+          _id: item.product,
+          status: { $ne: 'inactive' },
+          $or: [{ stock: { $exists: false } }, { stock: { $gte: qty } }],
+        },
+        { $inc: { stock: -qty } },
+        { returnDocument: 'after' }
+      );
+
+      if (!updated) {
+        // Roll back any previous decrements before bailing.
+        for (const d of decremented) {
+          await Product.findByIdAndUpdate(d.product, { $inc: { stock: d.qty } });
+        }
+        const probe = await Product.findById(item.product).select('name stock status');
+        if (!probe) {
+          res.status(404).json({ message: `Product not found: ${item.product}` });
+        } else if (probe.status === 'inactive') {
+          res.status(400).json({ message: `Product "${probe.name}" is no longer available` });
+        } else {
+          res.status(400).json({
+            message: `Insufficient stock for "${probe.name}". Available: ${probe.stock ?? 0}`,
+          });
+        }
         return;
       }
-      // Bug #17: Use server-side price, not frontend price
-      item.price = product.price;
-      calculatedItemsPrice += product.price * item.qty;
+
+      decremented.push({ product: String(item.product), qty });
+      productLookup.set(String(item.product), updated);
+
+      // Sprint 1 / BUG-B-016: Use the server price, ignore client-supplied prices.
+      item.price = updated.price;
+      item.qty = qty;
+      calculatedItemsPrice += updated.price * qty;
     }
 
-    // Bug #39: Recalculate tax and shipping server-side
-    const taxPrice = Math.round(calculatedItemsPrice * 0.1 * 100) / 100;
-    const shippingPrice = calculatedItemsPrice > 2000 ? 0 : 150;
-    const totalPrice = calculatedItemsPrice + taxPrice + shippingPrice;
+    // Sprint 4 / BUG-B-027 + BUG-F-014: read tax / shipping config from the
+    // Settings model instead of hard-coding. Settings page changes now
+    // actually affect orders. Falls back to historical defaults if missing.
+    const settings = await Settings.findOne({}).lean();
+    const taxPercentage = Number(settings?.taxPercentage ?? 10);
+    const flatShippingRate = Number(settings?.flatShippingRate ?? 150);
+    const freeShippingThreshold = Number(settings?.freeShippingThreshold ?? 2000);
 
-    // Bug #43: Save customer email and phone for order fulfillment
+    const taxPrice = Math.round(calculatedItemsPrice * (taxPercentage / 100) * 100) / 100;
+    const shippingPrice = calculatedItemsPrice >= freeShippingThreshold ? 0 : flatShippingRate;
+    const subtotalWithTaxShip = calculatedItemsPrice + taxPrice + shippingPrice;
+
+    // Sprint 1 / BUG-B-016 + Sprint 4 / BUG-B-006:
+    // Atomically claim a promotion redemption when validating, so two
+    // concurrent orders cannot both pass the usage-cap check.
+    let couponCode: string | undefined;
+    let discountAmount = 0;
+    let promoClaimed = false;
+    const rawCoupon = req.body.couponCode?.toString().trim().toUpperCase();
+    if (rawCoupon) {
+      const now = new Date();
+      // Conditions:
+      //   - exists, active
+      //   - not expired
+      //   - usageLimit unset OR usageCount < usageLimit
+      // We $inc usageCount only when all conditions hold. If `null` is returned,
+      // either the code doesn't exist or all conditions failed → reject.
+      const promo = await Promotion.findOneAndUpdate(
+        {
+          code: rawCoupon,
+          isActive: true,
+          $or: [{ expiryDate: { $exists: false } }, { expiryDate: null }, { expiryDate: { $gte: now } }],
+          $and: [
+            {
+              $or: [
+                { usageLimit: { $exists: false } },
+                { usageLimit: null },
+                { $expr: { $lt: ['$usageCount', '$usageLimit'] } },
+              ],
+            },
+          ],
+        },
+        { $inc: { usageCount: 1 } },
+        { returnDocument: 'after' }
+      );
+
+      if (!promo || (promo.minPurchaseAmount !== undefined && calculatedItemsPrice < promo.minPurchaseAmount)) {
+        // If we already incremented but min-purchase failed, roll back.
+        if (promo) {
+          try { await decrementUsage(rawCoupon); } catch (_) { /* swallow */ }
+        }
+        for (const d of decremented) {
+          await Product.findByIdAndUpdate(d.product, { $inc: { stock: d.qty } });
+        }
+        res.status(400).json({
+          message: 'Invalid, inactive, expired, used-up, or unmet-minimum promo code',
+        });
+        return;
+      }
+
+      promoClaimed = true;
+      couponCode = promo.code;
+      if (promo.type === 'percentage') {
+        discountAmount = (subtotalWithTaxShip * promo.value) / 100;
+      } else {
+        discountAmount = promo.value;
+      }
+      if (discountAmount > subtotalWithTaxShip) discountAmount = subtotalWithTaxShip;
+      discountAmount = Math.round(discountAmount * 100) / 100;
+    }
+
+    const finalTotal = Math.max(0, subtotalWithTaxShip - discountAmount);
+
     const customerEmail = req.body.customerEmail || req.user?.email;
     const customerPhone = req.body.customerPhone;
 
     const order = new Order({
       orderItems,
-      user: req.user?._id,
+      user: req.user._id,
       customerEmail,
       customerPhone,
       shippingAddress,
@@ -57,19 +171,38 @@ export const addOrderItems = async (req: AuthRequest, res: Response) => {
       itemsPrice: calculatedItemsPrice,
       taxPrice,
       shippingPrice,
-      totalPrice,
+      couponCode,
+      discountAmount,
+      totalPrice: finalTotal,
     });
 
-    const createdOrder = await order.save();
-
-    // Bug #14: Decrement stock for each ordered item
-    for (const item of orderItems) {
-      await Product.findByIdAndUpdate(item.product, { $inc: { stock: -item.qty } });
+    let createdOrder;
+    try {
+      createdOrder = await order.save();
+    } catch (saveErr) {
+      // If the save itself fails, refund the promotion redemption we just claimed.
+      if (promoClaimed && couponCode) {
+        try { await decrementUsage(couponCode); } catch (_) { /* swallow */ }
+      }
+      throw saveErr;
     }
 
     res.status(201).json(createdOrder);
   } catch (error: any) {
-    const castErr = (error as any); if (castErr.name === 'CastError') { res.status(400).json({ message: 'Invalid ID format' }); return; } res.status(500).json({ message: castErr.message || 'Server Error' });
+    // Roll back any partial stock decrement on unexpected failure.
+    for (const d of decremented) {
+      try {
+        await Product.findByIdAndUpdate(d.product, { $inc: { stock: d.qty } });
+      } catch (_) {
+        /* swallow — already in error path */
+      }
+    }
+    const castErr = error as any;
+    if (castErr.name === 'CastError') {
+      res.status(400).json({ message: 'Invalid ID format' });
+      return;
+    }
+    res.status(500).json({ message: castErr.message || 'Server Error' });
   }
 };
 
@@ -78,8 +211,26 @@ export const addOrderItems = async (req: AuthRequest, res: Response) => {
 // @access  Private
 export const getMyOrders = async (req: AuthRequest, res: Response) => {
   try {
-    const orders = await Order.find({ user: req.user?._id }).sort({ createdAt: -1 });
-    res.json(orders);
+    // Sprint 6 / BUG-B-054: support pagination so a customer with many orders
+    // doesn't OOM the page on first load. `limit` is clamped, default kept
+    // generous (50) so existing UIs that don't paginate still get most data.
+    const page = Math.max(1, parseInt(String(req.query.page ?? '1'), 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit ?? '50'), 10) || 50));
+    const skip = (page - 1) * limit;
+
+    const [orders, total] = await Promise.all([
+      Order.find({ user: req.user?._id }).sort({ createdAt: -1 }).skip(skip).limit(limit),
+      Order.countDocuments({ user: req.user?._id }),
+    ]);
+
+    // If no pagination query params were passed, preserve the legacy "bare array"
+    // shape so existing frontend hooks keep working without a coordinated change.
+    const wantsPaginated = req.query.page !== undefined || req.query.limit !== undefined;
+    if (wantsPaginated) {
+      res.json({ data: orders, pagination: { page, limit, total, pages: Math.ceil(total / limit) } });
+    } else {
+      res.json(orders);
+    }
   } catch (error: any) {
     const castErr = (error as any); if (castErr.name === 'CastError') { res.status(400).json({ message: 'Invalid ID format' }); return; } res.status(500).json({ message: castErr.message || 'Server Error' });
   }
@@ -113,20 +264,35 @@ export const getOrderById = async (req: AuthRequest, res: Response) => {
 // @access  Private/Admin
 export const getOrders = async (req: Request, res: Response) => {
   try {
-    const { status, page = '1', limit = '20' } = req.query;
-    let queryArgs: any = {};
+    const { status, page = '1', limit = '20', q } = req.query;
+    const queryArgs: any = {};
 
     if (status && typeof status === 'string') {
       queryArgs.status = status;
     }
 
-    // Bug #77: Add pagination support
+    // Sprint 6 / BUG-B-039: optional admin search across order id, customer
+    // email, and customer phone. Order id matches a tail-of-id prefix so admins
+    // can paste the short ID shown in the UI (`#A1B2C3D4`).
+    if (q && typeof q === 'string' && q.trim()) {
+      const term = q.trim();
+      const safeRe = new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      const or: any[] = [{ customerEmail: safeRe }, { customerPhone: safeRe }];
+      // Try matching as ObjectId if it parses; otherwise just the regex paths.
+      if (/^[a-f0-9]{24}$/i.test(term)) {
+        or.push({ _id: term });
+      }
+      queryArgs.$or = or;
+    }
+
     const pageNum = Math.max(1, parseInt(page as string) || 1);
     const limitNum = Math.min(100, Math.max(1, parseInt(limit as string) || 20));
     const skip = (pageNum - 1) * limitNum;
 
     const orders = await Order.find(queryArgs)
-      .populate('user', 'id firstName lastName')
+      // Bug #141: include email so the admin orders table can render contact
+      // info without N+1 follow-up fetches per row.
+      .populate('user', 'id firstName lastName email')
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limitNum);
@@ -139,8 +305,8 @@ export const getOrders = async (req: Request, res: Response) => {
         page: pageNum,
         limit: limitNum,
         total,
-        pages: Math.ceil(total / limitNum)
-      }
+        pages: Math.ceil(total / limitNum),
+      },
     });
   } catch (error: any) {
     const castErr = (error as any); if (castErr.name === 'CastError') { res.status(400).json({ message: 'Invalid ID format' }); return; } res.status(500).json({ message: castErr.message || 'Server Error' });
@@ -154,24 +320,33 @@ export const updateOrderToDelivered = async (req: Request, res: Response) => {
   try {
     const order = await Order.findById(req.params.id);
 
-    if (order) {
-      // Bug #95: Also sync status field when marking delivered
-      order.isDelivered = true;
-      order.deliveredAt = new Date();
-      order.status = 'Delivered';
-
-      const updatedOrder = await order.save();
-      res.json(updatedOrder);
-    } else {
+    if (!order) {
       res.status(404).json({ message: 'Order not found' });
+      return;
     }
+    // Sprint 5 / BUG-B-040: idempotent — already delivered? bail with 400.
+    if (order.isDelivered || order.status === 'Delivered') {
+      res.status(400).json({ message: 'Order is already marked as delivered' });
+      return;
+    }
+    if (order.status === 'Cancelled') {
+      res.status(400).json({ message: 'Cannot deliver a cancelled order' });
+      return;
+    }
+
+    order.isDelivered = true;
+    order.deliveredAt = new Date();
+    order.status = 'Delivered';
+
+    const updatedOrder = await order.save();
+    res.json(updatedOrder);
   } catch (error: any) {
     const castErr = (error as any); if (castErr.name === 'CastError') { res.status(400).json({ message: 'Invalid ID format' }); return; } res.status(500).json({ message: castErr.message || 'Server Error' });
   }
 };
 
-// Valid order status values
-const VALID_STATUSES = ['Pending', 'Processing', 'Shipped', 'Delivered', 'Cancelled'];
+// Bug #168: VALID_STATUSES sourced from `../constants/orderStatus` (imported above).
+const VALID_STATUSES = ORDER_STATUSES;
 
 // @desc    Update order status
 // @route   PUT /api/orders/:id/status
@@ -189,9 +364,13 @@ export const updateOrderStatus = async (req: Request, res: Response) => {
     const order = await Order.findById(req.params.id);
 
     if (order) {
-      // Bug #18: Prevent changing status of already-delivered orders
-      if (order.status === 'Delivered' && status !== 'Delivered') {
-        res.status(400).json({ message: 'Cannot change status of a delivered order' });
+      // Sprint 5 / BUG-B-041: terminal-state lock. Once an order is Delivered
+      // or Cancelled, the only allowed "transition" is to itself (idempotent).
+      // Without this, an admin could un-cancel an already-restocked order and
+      // double-count stock, or revert delivery and fake un-fulfilment.
+      const isTerminal = order.status === 'Delivered' || order.status === 'Cancelled';
+      if (isTerminal && status !== order.status) {
+        res.status(400).json({ message: `Cannot change status of a ${order.status?.toLowerCase()} order` });
         return;
       }
 
@@ -220,14 +399,24 @@ export const markOrderAsPaid = async (req: Request, res: Response) => {
   try {
     const order = await Order.findById(req.params.id);
 
-    if (order) {
-      order.isPaid = true;
-      order.paidAt = new Date();
-      const updatedOrder = await order.save();
-      res.json(updatedOrder);
-    } else {
+    if (!order) {
       res.status(404).json({ message: 'Order not found' });
+      return;
     }
+    // Sprint 5 / BUG-B-040: idempotent — already paid? bail with 400 instead
+    // of overwriting `paidAt` and confusing reconciliation.
+    if (order.isPaid) {
+      res.status(400).json({ message: 'Order is already marked as paid' });
+      return;
+    }
+    if (order.status === 'Cancelled') {
+      res.status(400).json({ message: 'Cannot mark a cancelled order as paid' });
+      return;
+    }
+    order.isPaid = true;
+    order.paidAt = new Date();
+    const updatedOrder = await order.save();
+    res.json(updatedOrder);
   } catch (error: any) {
     const castErr = (error as any); if (castErr.name === 'CastError') { res.status(400).json({ message: 'Invalid ID format' }); return; } res.status(500).json({ message: castErr.message || 'Server Error' });
   }
@@ -238,6 +427,10 @@ export const markOrderAsPaid = async (req: Request, res: Response) => {
 // @access  Private (owner or admin)
 export const cancelOrder = async (req: AuthRequest, res: Response) => {
   try {
+    // Sprint 4 / BUG-B-015: Atomically flip the order to Cancelled.
+    // Two concurrent cancel requests previously both passed the read-then-write
+    // gate, both restocked, doubling stock. findOneAndUpdate guarantees only one
+    // request actually transitions the doc.
     const order = await Order.findById(req.params.id);
 
     if (!order) {
@@ -245,7 +438,6 @@ export const cancelOrder = async (req: AuthRequest, res: Response) => {
       return;
     }
 
-    // Check if user is owner or admin
     const isOwner = order.user.toString() === req.user?._id?.toString();
     const isAdminUser = (req.user as any)?.isAdmin;
 
@@ -254,7 +446,6 @@ export const cancelOrder = async (req: AuthRequest, res: Response) => {
       return;
     }
 
-    // Bug #18: Already-delivered orders cannot be cancelled
     if (order.status === 'Delivered' || order.isDelivered) {
       res.status(400).json({ message: 'Cannot cancel an order that has already been delivered' });
       return;
@@ -265,12 +456,30 @@ export const cancelOrder = async (req: AuthRequest, res: Response) => {
       return;
     }
 
-    order.status = 'Cancelled';
-    const updatedOrder = await order.save();
+    const updatedOrder = await Order.findOneAndUpdate(
+      { _id: order._id, status: { $nin: ['Cancelled', 'Delivered'] } },
+      { status: 'Cancelled' },
+      { returnDocument: 'after' }
+    );
 
-    // Bug #15: Restore stock when order is cancelled
+    if (!updatedOrder) {
+      // Lost the race — somebody else already moved it out of cancellable state.
+      res.status(409).json({ message: 'Order is no longer cancellable' });
+      return;
+    }
+
+    // Restore stock for each item.
     for (const item of order.orderItems) {
       await Product.findByIdAndUpdate(item.product, { $inc: { stock: item.qty } });
+    }
+
+    // Sprint 4 / BUG-B-014: refund the promotion redemption when an order is cancelled.
+    if (order.couponCode) {
+      try {
+        await decrementUsage(order.couponCode);
+      } catch (e) {
+        console.error('[promo] decrementUsage on cancel failed', e);
+      }
     }
 
     res.json(updatedOrder);

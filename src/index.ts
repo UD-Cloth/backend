@@ -7,6 +7,8 @@ dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
 import cors from 'cors';
 import rateLimit from 'express-rate-limit';
+// Bug #137: gzip responses to cut bandwidth on JSON list endpoints.
+import compression from 'compression';
 
 import connectDB from './config/db';
 import { sanitizeMiddleware } from './middleware/sanitizeMiddleware';
@@ -21,21 +23,93 @@ import contactRoutes from './routes/contactRoutes';
 import uploadRoutes from './routes/uploadRoutes';
 import userRoutes from './routes/userRoutes';
 import cmsRoutes from './routes/cmsRoutes';
+import newsletterRoutes from './routes/newsletterRoutes';
+import promotionRoutes from './routes/promotionRoutes';
+import abandonedCartRoutes from './routes/abandonedCartRoutes';
+import settingsRoutes from './routes/settingsRoutes';
+import reviewRoutes from './routes/reviewRoutes';
+
+// Sprint 1 / BUG-B-001 + BUG-B-109 reinforcement:
+// Hard-fail at boot if either critical secret is missing.
+if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 16) {
+  console.error('FATAL: JWT_SECRET is missing or shorter than 16 characters');
+  process.exit(1);
+}
+if (!process.env.MONGO_URI) {
+  console.error('FATAL: MONGO_URI is not set');
+  process.exit(1);
+}
+// Sprint 6 / BUG-B-029: in production we MUST have FRONTEND_URL set, otherwise
+// every password-reset and email-verification email contains a localhost link.
+if (process.env.NODE_ENV === 'production' && !process.env.FRONTEND_URL) {
+  console.error('FATAL: FRONTEND_URL must be set in production (used in reset/verify emails)');
+  process.exit(1);
+}
 
 connectDB();
 
 const app: Express = express();
 const port = process.env.PORT || 5000;
 
-// Bug #5: Restrict CORS to known origins in production
-const allowedOrigins = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(',')
-  : ['http://localhost:5173', 'http://localhost:3000', 'https://urban-drape.vercel.app', 'https://www.urbandrape.in'];
+// Sprint 4 / BUG-B-037: behind Vercel / Cloudflare / any reverse proxy,
+// `req.ip` is the proxy's IP, so all clients share one rate-limit bucket.
+// Trusting the first hop lets express-rate-limit see the real client IP via
+// X-Forwarded-For. Set higher than 1 only if you stack multiple proxies.
+app.set('trust proxy', 1);
 
+// Bug #137: enable gzip/deflate compression for all responses.
+app.use(compression());
+
+// Sprint 1: Basic security headers (helmet equivalent without adding a dependency).
+app.use((_req: Request, res: Response, next: any) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('X-XSS-Protection', '0');
+  res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
+  if (process.env.NODE_ENV === 'production') {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+  next();
+});
+
+// Bug #5: Restrict CORS to known origins in production.
+// `.split(',').map(trim)` so a stray space in ALLOWED_ORIGINS doesn't silently
+// drop an origin from the allowlist (a CORS rejection looks identical to a
+// "missing entry" rejection in the browser, so this is easy to mis-diagnose).
+const defaultProdOrigins = [
+  'http://localhost:5173',
+  'http://localhost:3000',
+  'http://localhost:8080',
+  'https://urban-drape.vercel.app',
+  'https://urbandrape.in',
+  'https://www.urbandrape.in',
+];
+const envOrigins = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean)
+  : [];
+// Outside production we union env-configured origins with the localhost
+// defaults so dev tools running on alternate ports aren't blocked.
+const allowedOrigins = (process.env.NODE_ENV === 'production'
+  ? (envOrigins.length ? envOrigins : defaultProdOrigins)
+  : Array.from(new Set([...defaultProdOrigins, ...envOrigins, 'http://localhost:5174', 'http://127.0.0.1:8080', 'http://127.0.0.1:5173'])));
+
+// Sprint 1: Use the same allowlist in dev as prod (just include localhost origins).
+// The previous '*' in dev would echo any Origin and accept credentials elsewhere.
 app.use(cors({
-  origin: process.env.NODE_ENV === 'production' ? allowedOrigins : '*',
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  // Allow same-origin / curl / server-to-server (no Origin header) plus the
+  // explicit allowlist. Anything else is rejected.
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error(`CORS: origin ${origin} not allowed`));
+  },
+  // Sprint 7 fix: include PATCH. `api.patch` (added Sprint 7 for the admin
+  // subscribers toggle) was failing preflight because PATCH wasn't listed.
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  // Sprint 7 / BUG-B-058: include common headers the frontend may send so
+  // preflight doesn't silently fail when adding tracing or XHR conventions.
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token', 'X-Requested-With', 'Accept'],
+  credentials: true,
 }));
 
 // Bug #84: Add rate limiting to protect against brute-force and DDoS
@@ -47,13 +121,21 @@ const apiLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-// Stricter limiter for auth endpoints (login/register)
+// Stricter limiter for auth endpoints (login/register).
+// In non-production environments and for localhost we relax the limit so dev/QA
+// flows aren't locked out after a handful of attempts.
+const isProduction = process.env.NODE_ENV === 'production';
 const authLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, // 1 hour
-  max: 20, // Limit each IP to 20 requests per hour
+  max: isProduction ? 20 : 1000,
   message: { message: 'Too many login/register attempts, please try again after an hour' },
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => {
+    if (isProduction) return false;
+    const ip = req.ip || '';
+    return ip === '::1' || ip === '127.0.0.1' || ip === '::ffff:127.0.0.1';
+  },
 });
 
 app.use('/api/auth', authLimiter);
@@ -67,29 +149,11 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // Bug #8: Add input sanitization middleware to strip HTML/XSS
 app.use(sanitizeMiddleware);
 
-// Bug #10: CSRF token middleware - validate for state-changing endpoints
-const csrfTokenGenerator = (): string => {
-  return require('crypto').randomBytes(32).toString('hex');
-};
-
-const csrfMiddleware = (req: Request, res: Response, next: any) => {
-  // Generate CSRF token for GET requests
-  if (req.method === 'GET') {
-    const token = csrfTokenGenerator();
-    res.set('X-CSRF-Token', token);
-    (req as any).csrfToken = token;
-  }
-  // Validate CSRF token for POST/PUT/DELETE
-  if (['POST', 'PUT', 'DELETE'].includes(req.method)) {
-    const headerToken = req.headers['x-csrf-token'] as string;
-    const cookieToken = (req as any).cookies?.['csrf-token'];
-    if (headerToken || cookieToken) {
-      // Token validation would go here in production with a proper session store
-      // For now, we accept presence of token
-    }
-  }
-  next();
-};
+// Sprint 4 / BUG-B-034: previously a no-op CSRF stub lived here that emitted
+// a token but never validated it. The API uses Bearer tokens (no cookies for
+// auth), so CSRF is not the threat model — Bearer-only APIs are not vulnerable
+// to classic CSRF. Removed the stub. If a cookie-based session is ever added,
+// implement a real synchronizer-token / double-submit pattern at that point.
 
 try {
   // Bug #165: Use consistent path relative to project root, not process.cwd()
@@ -159,6 +223,11 @@ apiRouter.use('/admin', statsRoutes);
 apiRouter.use('/admin/users', userRoutes);
 apiRouter.use('/contact', contactRoutes);
 apiRouter.use('/cms', cmsRoutes);
+apiRouter.use('/newsletter', newsletterRoutes);
+apiRouter.use('/promotions', promotionRoutes);
+apiRouter.use('/abandoned-carts', abandonedCartRoutes);
+apiRouter.use('/settings', settingsRoutes);
+apiRouter.use('/reviews', reviewRoutes);
 
 app.use('/api', apiRouter);
 // Bug #11: Removed root-level fallback that exposed /products without /api prefix

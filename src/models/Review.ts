@@ -12,8 +12,10 @@ const ReviewSchema: Schema = new Schema(
   {
     user: { type: mongoose.Schema.Types.ObjectId, required: true, ref: 'User' },
     product: { type: mongoose.Schema.Types.ObjectId, required: true, ref: 'Product' },
-    rating: { type: Number, required: true, min: 1, max: 5 },
-    comment: { type: String, required: true, trim: true },
+    // Sprint 5 / BUG-B-048: integers only.
+    rating: { type: Number, required: true, min: 1, max: 5, validate: { validator: Number.isInteger, message: 'Rating must be an integer' } },
+    // Sprint 5 / BUG-B-047: cap comment length at the schema level too.
+    comment: { type: String, required: true, trim: true, maxlength: 2000 },
   },
   { timestamps: true }
 );

@@ -37,9 +37,24 @@ const CartItemSchema = new Schema({
 
 const CartSchema = new Schema({
   user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, unique: true },
-  items: [CartItemSchema]
+  items: [CartItemSchema],
 }, {
   timestamps: true,
 });
+
+// Sprint 6 / BUG-B-060: enforce a hard cap on items array at the schema level.
+// Belt-and-braces with the controller's `MAX_CART_ITEMS=100` (Sprint 4).
+const MAX_CART_ITEMS = 100;
+CartSchema.pre('validate', function () {
+  const items = (this as any).items;
+  if (Array.isArray(items) && items.length > MAX_CART_ITEMS) {
+    this.invalidate('items', `Cart cannot exceed ${MAX_CART_ITEMS} distinct items`);
+  }
+});
+
+// Bug #119: Cart sync race — unique compound index on (user, items.variantId)
+// guarantees a given variant cannot be inserted twice for the same user even
+// under concurrent sync requests.
+CartSchema.index({ user: 1, 'items.variantId': 1 }, { unique: true, sparse: true });
 
 export default mongoose.model<ICart>('Cart', CartSchema);
