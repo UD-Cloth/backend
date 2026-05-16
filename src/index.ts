@@ -84,6 +84,7 @@ const defaultProdOrigins = [
   'https://urban-drape.vercel.app',
   'https://urbandrape.in',
   'https://www.urbandrape.in',
+  'https://backend-six-orcin-57.vercel.app',
 ];
 const envOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean)
@@ -92,7 +93,7 @@ const envOrigins = process.env.ALLOWED_ORIGINS
 // defaults so dev tools running on alternate ports aren't blocked.
 const allowedOrigins = (process.env.NODE_ENV === 'production'
   ? (envOrigins.length ? envOrigins : defaultProdOrigins)
-  : Array.from(new Set([...defaultProdOrigins, ...envOrigins, 'http://localhost:5174', 'http://127.0.0.1:8080', 'http://127.0.0.1:5173'])));
+  : Array.from(new Set([...defaultProdOrigins, ...envOrigins, 'http://localhost:5174', 'http://127.0.0.1:8080', 'http://127.0.0.1:5173','https://backend-six-orcin-57.vercel.app','https://urban-drape.vercel.app'])));
 
 // Sprint 1: Use the same allowlist in dev as prod (just include localhost origins).
 // The previous '*' in dev would echo any Origin and accept credentials elsewhere.
